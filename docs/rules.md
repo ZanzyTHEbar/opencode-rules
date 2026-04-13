@@ -1,10 +1,11 @@
 # OpenCode Rules
 
-This document explains how to use OpenCode Rules to inject custom instructions into the agent's system prompt. Rules are automatically discovered and injected via OpenCode's hook system, enabling context-aware rule filtering based on:
+This document explains how to use OpenCode Rules to inject custom instructions into the agent's system prompt. Rules are automatically discovered and injected via OpenCode's hook system, and can also be pulled in manually for a turn or pinned for a session.
 
 - **Legacy filters**: file paths (`globs`), user prompts (`keywords`), and available tools (`tools`)
 - **Runtime filters**: model, agent, command, project type, git branch, OS, and CI environment
 - **Match semantics**: `match: any` (default OR logic) or `match: all` (AND logic)
+- **Manual controls**: inline `[[orule:...]]` refs, `/orules` commands, and rule reference completion
 
 ## Rule Files
 
@@ -205,6 +206,64 @@ Testing standards for the project.
 
 This rule applies when EITHER a test file is in context OR the user mentions testing.
 
+## Manual Rule Controls
+
+### Canonical rule IDs and aliases
+
+Each discovered rule gets a canonical ID based on its relative path without the file extension.
+
+- `security/review.mdc` → `security/review`
+- `frontend/react.md` → `frontend/react`
+
+If a global rule and a project rule would otherwise share the same ID, the plugin disambiguates them with scope prefixes such as `global:` and `project:`.
+
+Rules may also declare optional aliases:
+
+```markdown
+---
+aliases:
+  - secure
+  - security-review
+---
+```
+
+Aliases are useful shorthand for manual references, but ambiguous aliases are rejected.
+
+### Inline one-turn rule refs
+
+Use `[[orule:<rule-id>]]` inside a normal prompt to include a rule for the next evaluation only.
+
+```text
+Please focus on auth edge cases [[orule:security/review]]
+```
+
+During `experimental.chat.messages.transform`, the plugin strips the inline token from the latest user message and stores the requested rule in session state. The next `experimental.chat.system.transform` evaluation then injects that rule alongside any automatic matches.
+
+If an inline ref is unresolved or ambiguous, it is currently ignored silently.
+
+### `/orules` command family
+
+`/orules` provides a plugin-side control surface for rule discovery and pinned rules:
+
+- `/orules` or `/orules help`
+- `/orules list [query]`
+- `/orules active`
+- `/orules show <rule>`
+- `/orules activate <rule...>`
+- `/orules deactivate <rule...>`
+- `/orules clear`
+
+`activate` pins rules for the current session. `deactivate` and `clear` remove pinned rules. Command responses are emitted as ignored no-reply messages, so they do not require a model response.
+
+### Completion
+
+When a prefix resolves to exactly one candidate, the plugin can append a completion suffix for:
+
+- `[[orule:...`
+- `/orules show ...`
+- `/orules activate ...`
+- `/orules deactivate ...`
+
 ### Requiring All Conditions (match: all)
 
 Use `match: all` when you need every declared condition to match:
@@ -234,26 +293,29 @@ The plugin uses OpenCode's hook system to track context and inject rules:
 1. **Context Tracking**:
    - `tool.execute.before` hook captures file paths as tools execute (read, edit, write, glob, grep, etc.)
    - `chat.message` hook captures the latest user prompt as messages arrive
-   - `experimental.chat.messages.transform` hook seeds session state from message history on first call only
+   - `experimental.chat.messages.transform` seeds session state from message history once and strips inline `[[orule:...]]` refs from the latest user text when present
 
 2. **Rule Injection**:
    - `experimental.chat.system.transform` hook evaluates all discovered rules against the accumulated context
+   - The evaluation merges automatic matches, session-pinned rules, and one-turn inline refs
    - Rules are filtered based on:
-     - **File paths** (`globs`): Glob patterns matched against files in context
-     - **User prompts** (`keywords`): Keyword matching against the latest user message
-     - **Available tools** (`tools`): Exact match against tool IDs available in the environment
-     - **Model** (`model`): Exact match against current LLM model ID
-     - **Agent** (`agent`): Exact match against current agent type
-     - **Command** (`command`): Exact match against current slash command
-     - **Project** (`project`): Match against detected project type tags
-     - **Branch** (`branch`): Exact or glob match against current git branch
-     - **OS** (`os`): Exact match against current operating system
-     - **CI** (`ci`): Boolean equality against CI environment detection
+   - **File paths** (`globs`): Glob patterns matched against files in context
+   - **User prompts** (`keywords`): Keyword matching against the latest user message
+   - **Available tools** (`tools`): Exact match against tool IDs available in the environment
+   - **Model** (`model`): Exact match against current LLM model ID
+   - **Agent** (`agent`): Exact match against current agent type
+   - **Command** (`command`): Exact match against current slash command
+   - **Project** (`project`): Match against detected project type tags
+   - **Branch** (`branch`): Exact or glob match against current git branch
+   - **OS** (`os`): Exact match against current operating system
+   - **CI** (`ci`): Boolean equality against CI environment detection
    - Missing runtime context (e.g., no git branch available) is treated as a non-match for that dimension
-   - Matching rules are formatted and appended to the system prompt
+   - Matching rules are deduplicated, formatted, and appended to the system prompt
 
 3. **Session Persistence**:
    - `experimental.session.compacting` hook preserves context paths during session compression
+   - Active rule state is written to `~/.opencode/state/opencode-rules/{sessionId}.json`
+   - The state file keeps `matchedRulePaths` for compatibility and may also include structured `activeRules` records with activation sources
    - This ensures rules remain applicable after session compaction
 
 ## Rule Matching Examples

@@ -57,7 +57,7 @@ When a session is compacted, the `experimental.session.compacting` hook injects 
 The plugin uses multiple hooks to incrementally build the working set:
 
 1. **`tool.execute.before`**: Captures file paths from tool calls (read, edit, write, glob, grep)
-2. **`experimental.chat.messages.transform`**: Seeds the working set from message history on first encounter
+2. **`experimental.chat.messages.transform`**: Seeds the working set from message history once and strips inline `[[orule:...]]` refs from the latest user text when present
 3. **`chat.message`**: Updates working set with latest user prompts
 
 This multi-hook approach ensures:
@@ -73,12 +73,15 @@ Per-session state is stored in `sessionStateMap` with the following structure:
 ```typescript
 interface SessionState {
   contextPaths: Set<string>; // Current working set of file paths
+  manualPinnedRuleIDs: Set<string>; // Rules pinned for the session
+  pendingInlineRuleIDs: Set<string>; // One-turn inline refs awaiting evaluation
   lastUserPrompt?: string; // Latest user message text
   lastUpdated: number; // Timestamp for LRU cache pruning
   isCompacting?: boolean; // Flag: compaction in progress
   compactingSince?: number; // Timestamp when compaction started
   seededFromHistory: boolean; // Flag: history has been scanned
   seedCount?: number; // Count of history scans
+  lastProcessedInlineMessageID?: string; // De-dupe repeated inline-ref parsing
 }
 ```
 

@@ -27,16 +27,19 @@ approach.
 - **Dual-format support**: Load rules from both `.md` and `.mdc` files
 - **Conditional rules**: Apply rules based on file paths, prompt keywords, or available tools
 - **Runtime filtering**: Filter rules by model, agent, command, project type, git branch, OS, and CI
+- **Manual rule controls**: Pull a rule into the next turn with `[[orule:<rule-id>]]` or pin it with `/orules`
+- **Rule aliases**: Add `aliases` in frontmatter for shorter manual references
 - **Branch glob patterns**: Match branches using glob patterns (e.g., `feature/*`, `release/**`)
 - **Matching modes**: Use `match: any` (default) for OR logic or `match: all` for AND logic
 - **Keyword matching**: Apply rules when the user's prompt contains specific keywords
 - **Tool-based rules**: Apply rules only when specific MCP tools are available
 - **Global and project-level rules**: Define rules at both system and project scopes
 - **Context-aware injection**: Rules filtered by extracted file paths and user prompts
+- **Rule completion**: Complete inline refs and supported `/orules` arguments when a unique match exists
 - **Zero-configuration**: Works out of the box with XDG Base Directory specification
 - **TypeScript-first**: Built with TypeScript for type safety and developer experience
 - **Performance optimized**: Efficient file discovery and minimal startup overhead
-- **TUI sidebar**: Real-time sidebar in the OpenCode TUI showing rule status with active/inactive indicators
+- **TUI sidebar**: Real-time sidebar in the OpenCode TUI showing active state, provenance, rule IDs, and aliases
 
 ## Quick Start
 
@@ -97,10 +100,11 @@ That's it! The rule will now be automatically injected into all AI agent prompts
 2. **Parsing**: Extract metadata from files with YAML front matter
 3. **Tool Execution**: `tool.execute.before` hook captures file paths before tools run
 4. **Message Flow**: `chat.message` hook updates user prompt as messages arrive
-5. **Initial Seeding**: `experimental.chat.messages.transform` extracts context from message history once
-6. **Rule Filtering**: `experimental.chat.system.transform` evaluates rules based on context and injects into system prompt
-7. **State Persistence**: After filtering, matched rule paths are written to `~/.opencode/state/opencode-rules/{sessionId}.json` for TUI consumption
-8. **Compaction Persistence**: `experimental.session.compacting` preserves context during session compression
+5. **History + Inline Processing**: `experimental.chat.messages.transform` seeds context from message history once and strips inline `[[orule:...]]` refs from the latest user text while queueing them for the next evaluation
+6. **Rule Filtering**: `experimental.chat.system.transform` evaluates automatic rules, merges pinned and inline manual rules, and injects the combined result into the system prompt
+7. **Commands + Completion**: `/orules` commands are handled by the plugin and `experimental.text.complete` completes inline refs and supported command arguments when there is one unique match
+8. **State Persistence**: After filtering, active rule state is written to `~/.opencode/state/opencode-rules/{sessionId}.json` for TUI consumption, preserving `matchedRulePaths` and optional structured provenance
+9. **Compaction Persistence**: `experimental.session.compacting` preserves context during session compression
 
 ## Performance
 
@@ -144,6 +148,9 @@ keywords:
 tools:
   - 'mcp_websearch'
   - 'mcp_lsp'
+aliases:
+  - ts-refactor
+  - typescript-refactor
 model:
   - gpt-5.3-codex
   - claude-sonnet-4
@@ -171,6 +178,9 @@ match: any
 
 - `globs` (optional): Array of glob patterns for file-based matching
   - Rule applies when any file in context matches a pattern
+- `aliases` (optional): Array of alternate names for manual rule resolution
+  - Used by `[[orule:<ref>]]` and `/orules ...`
+  - Ambiguous aliases are rejected rather than guessed
 - `keywords` (optional): Array of keywords for prompt-based matching
   - Rule applies when the user's prompt contains any keyword
   - Case-insensitive, word-boundary matching (e.g., "test" matches "testing")
@@ -200,6 +210,61 @@ match: any
   - `all`: Rule applies only if ALL declared conditions match
 
 **Note:** When a runtime context value is unavailable (e.g., not in a git repository), that dimension is treated as a non-match.
+
+## Manual Rule Controls
+
+Automatic matching remains the default, but you can also pull rules in explicitly.
+
+### Inline one-turn refs
+
+Use `[[orule:<rule-id>]]` in a normal prompt to include a rule for the next evaluation only.
+
+Example:
+
+```text
+Please review this change carefully [[orule:security/review]]
+```
+
+The inline token is stripped before the model sees the user text, but the referenced rule is injected into the next system prompt evaluation.
+
+If an inline ref is unresolved or ambiguous, it is currently ignored silently.
+
+### `/orules` commands
+
+The plugin registers a namespaced `/orules` command family:
+
+- `/orules` or `/orules help`
+- `/orules list [query]`
+- `/orules active`
+- `/orules show <rule>`
+- `/orules activate <rule...>`
+- `/orules deactivate <rule...>`
+- `/orules clear`
+
+Pinned rules stay active for the current session until deactivated or cleared.
+
+### Canonical rule IDs
+
+Rules are resolved by canonical rule IDs derived from their relative paths without extensions.
+
+- `security/review.mdc` → `security/review`
+- `frontend/react.md` → `frontend/react`
+
+If global and project rules collide, IDs are scope-qualified:
+
+- `global:frontend/react`
+- `project:frontend/react`
+
+Aliases from frontmatter may also resolve a rule when they are unique.
+
+### Completion
+
+When the current prefix matches exactly one rule, the plugin can complete:
+
+- `[[orule:sec...`
+- `/orules show sec...`
+- `/orules activate sec...`
+- `/orules deactivate sec...`
 
 ### Matching Behavior
 
@@ -395,6 +460,31 @@ When working on feature branches locally:
 
 This rule uses `match: all` and only applies when ALL conditions are met: specific model, programmer agent, feature branch, Unix OS, and not in CI.
 
+### Manual Rule Alias Example
+
+Create `~/.config/opencode/rules/security/review.mdc`:
+
+```markdown
+---
+aliases:
+  - secure
+  - security-review
+---
+
+# Security Review
+
+- Check auth and permission boundaries
+- Look for secret exposure and unsafe logging
+- Prefer least-privilege defaults
+```
+
+You can then reference it with either of these:
+
+```text
+[[orule:security/review]]
+[[orule:secure]]
+```
+
 ### Organized Rules with Subdirectories
 
 You can organize rules into subdirectories for better management. Rules are discovered recursively from all subdirectories:
@@ -454,7 +544,7 @@ opencode-rules/
 │   ├── project-fingerprint.ts # Project type detection (Node.js, Python, etc.)
 │   ├── mcp-tools.ts          # MCP tool ID extraction
 │   ├── git-branch.ts         # Git branch detection
-│   ├── active-rules-state.ts # Persists matched rules per session for TUI
+│   ├── active-rules-state.ts # Persists active rules and provenance per session for TUI
 │   ├── debug.ts              # Debug logging utilities
 │   ├── utils.ts              # Re-export facade for backwards compatibility
 │   ├── test-fixtures.ts      # Shared test fixtures and builders
@@ -483,7 +573,12 @@ The following highlights the primary runtime modules:
 - **runtime-chat.ts** - Extracts text from chat message parts for keyword matching
 - **rule-discovery.ts** - Recursively scans directories for `.md`/`.mdc` rule files
 - **rule-metadata.ts** - Parses YAML frontmatter into typed `RuleMetadata`
-- **rule-filter.ts** - Evaluates rules against context (globs, keywords, tools, runtime filters); returns `FilterResult` with `formattedRules` and `matchedPaths`
+- **rule-filter.ts** - Evaluates automatically matched rules against context (globs, keywords, tools, runtime filters)
+- **rule-registry.ts** - Builds canonical rule IDs, resolves aliases, supports search and completion
+- **manual-rule-refs.ts** - Parses and strips inline `[[orule:...]]` references
+- **orules-command.ts** - Formats `/orules` command output
+- **rule-selection.ts** - Merges automatic and manual rule activation with provenance
+- **text-completion.ts** - Detects completion requests for inline refs and `/orules`
 - **message-paths.ts** - Extracts file paths from tool invocation arguments and message text
 - **message-context.ts** - Extracts user prompt text, slash commands, and session IDs from message parts
 - **session-store.ts** - Manages per-session state with LRU eviction
@@ -495,7 +590,7 @@ The following highlights the primary runtime modules:
 
 ### TUI Sidebar
 
-The plugin registers a `sidebar_content` slot in the OpenCode TUI, displaying all discovered rules (global and project-local) with their active state and metadata.
+The plugin registers a `sidebar_content` slot in the OpenCode TUI, displaying all discovered rules (global and project-local) with their active state, provenance, canonical IDs, aliases, and metadata.
 
 **Requirements:** `@opencode-ai/plugin` ^1.3.7 with TUI support.
 
@@ -503,6 +598,8 @@ The plugin registers a `sidebar_content` slot in the OpenCode TUI, displaying al
 
 - Collapsible "Project" and "Global" sections grouping rules by scope
 - Active/inactive status indicators (green bullet for active, muted for inactive) based on persisted state from the current session
+- Activation labels such as `auto`, `manual`, and `auto+manual`
+- Canonical rule IDs and aliases in the expanded details view
 - Condition summary for conditional rules ("always active" for unconditional ones)
 - Expandable detail panel with all metadata fields (globs, keywords, tools, model, agent, command, project, branch, os, ci, match)
 - Loading, error, and empty states
@@ -512,6 +609,7 @@ The plugin registers a `sidebar_content` slot in the OpenCode TUI, displaying al
 - Active rules are sorted to the top within each section
 - Subscribes to `message.updated` and `session.status` events for real-time refresh (150ms debounce, filtered by session ID)
 - Active state is read from `~/.opencode/state/opencode-rules/{sessionId}.json`, written by the server plugin after each rule evaluation
+- The state file keeps `matchedRulePaths` for compatibility and may also include structured `activeRules` entries with activation sources
 
 ### Build and Test
 
@@ -563,11 +661,11 @@ This plugin uses OpenCode's hook system for incremental, stateful rule injection
    - Extracts and stores the latest user prompt text
    - Enables keyword-based rule matching across the conversation flow
 
-3. **`experimental.chat.messages.transform`** - One-time seeding fallback
-   - Fires before the first LLM call only (skipped on subsequent turns)
-   - Seeds session state from full message history if needed
-   - Provides fallback context extraction from all visible messages
-   - Ensures rules apply even if initial context wasn't captured by tool hooks
+3. **`experimental.chat.messages.transform`** - History seeding and inline ref stripping
+   - Seeds session state from full message history once per session
+   - Continues to inspect the latest user text on later turns for inline `[[orule:...]]` references
+   - Strips inline control tokens before the model sees the prompt
+   - Queues referenced rules for the next system prompt evaluation
 
 4. **`experimental.chat.system.transform`** - Rule injection and filtering
    - Fires before each LLM system prompt is constructed
@@ -577,10 +675,18 @@ This plugin uses OpenCode's hook system for incremental, stateful rule injection
      - Latest user prompt (`keywords`)
      - Available tool IDs (`tools`)
      - Runtime environment (model, agent, command, project, branch, OS, CI)
+     - Manual pinned rules and one-turn inline refs
    - Command is inferred from the leading slash token (first token) of the latest user prompt
-   - Appends formatted rules to the system prompt
+   - Appends deduplicated formatted rules to the system prompt
 
-5. **`experimental.session.compacting`** - Compaction context preservation
+5. **`command.execute.before`** - `/orules` command handling
+   - Registers and handles plugin-side rule inspection and manual activation commands
+   - Sends ignored `noReply` session messages for fully handled command output
+
+6. **`experimental.text.complete`** - Rule reference suffix completion
+   - Completes inline refs and supported `/orules` arguments when there is exactly one match
+
+7. **`experimental.session.compacting`** - Compaction context preservation
    - Fires when a session is compacted (summarized)
    - Injects current context paths into the compaction context
    - Prevents rules from being lost during session compression
@@ -589,8 +695,9 @@ This plugin uses OpenCode's hook system for incremental, stateful rule injection
 
 This plugin depends on experimental OpenCode APIs:
 
-- `experimental.chat.messages.transform` (fallback seeding)
+- `experimental.chat.messages.transform` (history seeding + inline ref stripping)
 - `experimental.chat.system.transform` (rule injection)
+- `experimental.text.complete` (rule completion)
 - `experimental.session.compacting` (compaction context)
 
 These APIs may change in future OpenCode versions. Check OpenCode release notes when upgrading.
@@ -618,12 +725,14 @@ This will log information about:
 2. Check file extensions are `.md` or `.mdc`
 3. Ensure files with metadata have properly formatted YAML
 4. Enable debug logging (`OPENCODE_RULES_DEBUG=1`) to see which rules are being matched
+5. If using manual refs, run `/orules list` to confirm the canonical rule ID or alias you want
 
 ### Common Issues
 
 - **Missing directories**: Plugin gracefully handles missing directories
 - **Invalid YAML**: Metadata parsing errors are logged but don't crash the plugin
 - **Pattern mismatches**: Use relative paths from project root for glob patterns
+- **Ambiguous manual references**: Use the full canonical rule ID (for example `project:frontend/react`) when aliases or paths collide
 
 ## Contributing
 

@@ -1,15 +1,27 @@
 // tui/data/rules.ts
-import { discoverRuleFiles, getCachedRule } from '../../src/rule-discovery.js';
+import { discoverRuleFiles } from '../../src/rule-discovery.js';
 import type { RuleMetadata } from '../../src/rule-metadata.js';
+import {
+  formatConditionSummary,
+  hasConditions,
+} from '../../src/rule-metadata-display.js';
 import { readActiveRulesState } from '../../src/active-rules-state.js';
+import { RuleRegistry } from '../../src/rule-registry.js';
+import { summarizeRuleActivationLabel } from '../../src/rule-selection.js';
 import path from 'path';
+
+export { formatConditionSummary, hasConditions };
 
 /** Represents a rule as displayed in the sidebar */
 export interface SidebarRuleEntry {
   /** Display name (filename stem, disambiguated if needed) */
   name: string;
+  /** Canonical rule ID used by commands and inline refs */
+  ruleId: string;
   /** Relative file path from the rules directory root */
   path: string;
+  /** Optional aliases defined for the rule */
+  aliases: string[];
   /** Whether this rule came from global or project-local rules dir */
   source: 'global' | 'project';
   /** Whether the rule has any conditional metadata */
@@ -25,6 +37,10 @@ export interface SidebarRuleEntry {
    * - null: state not yet determined (conditional rule without state file)
    */
   isActive: boolean | null;
+  /** Summary label for how the rule became active */
+  activationLabel?: string;
+  /** Raw activation sources when evaluation state is available */
+  activationSources?: Array<'automatic' | 'manual-inline' | 'manual-pinned'>;
 }
 
 export interface LoadSidebarRulesResult {
@@ -47,6 +63,8 @@ export async function loadSidebarRules(
 ): Promise<LoadSidebarRulesResult> {
   // discoverRuleFiles accepts string | undefined, not null
   const discovered = await discoverRuleFiles(projectDir ?? undefined);
+  const registry = new RuleRegistry(discovered);
+  const registryEntries = await registry.listEntries();
 
   // Read active rules state if sessionId provided
   const activeState = sessionId ? await readActiveRulesState(sessionId) : null;
@@ -54,31 +72,30 @@ export async function loadSidebarRules(
   const matchedPathsSet = hasEvaluationState
     ? new Set(activeState.matchedRulePaths)
     : null;
+  const activeRulesByPath = new Map(
+    (activeState?.activeRules ?? []).map(rule => [rule.filePath, rule])
+  );
 
   const entries: SidebarRuleEntry[] = [];
-  let skippedCount = 0;
+  const skippedCount = Math.max(discovered.length - registryEntries.length, 0);
 
-  for (const rule of discovered) {
-    const cached = await getCachedRule(rule.filePath);
-    if (!cached) {
-      // getCachedRule() already logs a warning for read failures,
-      // so we only increment the counter here — no duplicate log.
-      skippedCount++;
-      continue;
-    }
-
-    const meta = cached.metadata;
+  for (const rule of registryEntries) {
+    const meta = rule.metadata;
     const source = ruleSource(rule.filePath, projectDir);
     const isConditional = hasConditions(meta);
     const conditionSummary = isConditional
-      ? formatConditionSummary(meta!)
+      ? formatConditionSummary(meta)
       : 'always active';
+    const activeRule = activeRulesByPath.get(rule.filePath);
+    const activationLabel = activeRule
+      ? summarizeRuleActivationLabel(activeRule.sources)
+      : undefined;
 
     // Determine isActive based on state file or fallback logic
     let isActive: boolean | null;
     if (matchedPathsSet !== null) {
       // With state file: check if this rule's absolute path is in matchedPaths
-      isActive = matchedPathsSet.has(rule.filePath);
+      isActive = matchedPathsSet.has(rule.filePath) || Boolean(activeRule);
     } else {
       // Without state file: unconditional = true, conditional = null
       isActive = isConditional ? null : true;
@@ -86,12 +103,20 @@ export async function loadSidebarRules(
 
     entries.push({
       name: '', // placeholder — set in disambiguation pass
+      ruleId: rule.ruleId,
       path: rule.relativePath,
+      aliases: rule.aliases,
       source,
       isConditional,
       conditionSummary,
-      metadata: meta ?? {},
+      metadata: meta,
       isActive,
+      ...(activeRule
+        ? {
+            ...(activationLabel ? { activationLabel } : {}),
+            activationSources: activeRule.sources,
+          }
+        : {}),
     });
   }
 
@@ -125,62 +150,6 @@ export function ruleSource(
   const projectRulesPrefix =
     path.join(projectDir, '.opencode', 'rules') + path.sep;
   return filePath.startsWith(projectRulesPrefix) ? 'project' : 'global';
-}
-
-/**
- * Check if metadata has any conditional fields set.
- */
-export function hasConditions(meta: RuleMetadata | undefined): boolean {
-  if (!meta) return false;
-  return !!(
-    meta.globs ||
-    meta.keywords ||
-    meta.tools ||
-    meta.model ||
-    meta.agent ||
-    meta.command ||
-    meta.project ||
-    meta.branch ||
-    meta.os ||
-    meta.ci !== undefined
-  );
-}
-
-/**
- * Build a human-readable, comma-separated summary of active conditions.
- * E.g., "globs: src/*.ts, keywords: auth, security"
- */
-export function formatConditionSummary(meta: RuleMetadata): string {
-  const parts: string[] = [];
-
-  const arrayFields: Array<[keyof RuleMetadata, string]> = [
-    ['globs', 'globs'],
-    ['keywords', 'keywords'],
-    ['tools', 'tools'],
-    ['model', 'model'],
-    ['agent', 'agent'],
-    ['command', 'command'],
-    ['project', 'project'],
-    ['branch', 'branch'],
-    ['os', 'os'],
-  ];
-
-  for (const [field, label] of arrayFields) {
-    const value = meta[field];
-    if (Array.isArray(value) && value.length > 0) {
-      parts.push(`${label}: ${(value as string[]).join(', ')}`);
-    }
-  }
-
-  if (meta.ci !== undefined) {
-    parts.push(`ci: ${String(meta.ci)}`);
-  }
-
-  if (meta.match) {
-    parts.push(`match: ${meta.match}`);
-  }
-
-  return parts.join(', ');
 }
 
 /**

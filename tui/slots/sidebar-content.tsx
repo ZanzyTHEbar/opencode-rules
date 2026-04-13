@@ -82,10 +82,34 @@ function RuleSection(props: RuleSectionProps): JSX.Element {
                   <box flexDirection="row" gap={1}>
                     <text fg={bulletColor(rule)}>•</text>
                     <text fg={props.theme.text}>{rule.name}</text>
+                    <Show when={rule.activationLabel}>
+                      <text fg={props.theme.textMuted}>
+                        {' '}
+                        ({rule.activationLabel})
+                      </text>
+                    </Show>
                   </box>
                   <Show when={props.expandedIndex === globalIndex()}>
                     <box flexDirection="column" paddingLeft={4}>
                       <text fg={props.theme.textMuted}>{rule.path}</text>
+                      <text fg={props.theme.textMuted}>
+                        Rule ID: {rule.ruleId}
+                      </text>
+                      <Show when={rule.aliases.length > 0}>
+                        <text fg={props.theme.textMuted}>
+                          Aliases: {rule.aliases.join(', ')}
+                        </text>
+                      </Show>
+                      <Show
+                        when={
+                          rule.activationSources &&
+                          rule.activationSources.length > 0
+                        }
+                      >
+                        <text fg={props.theme.textMuted}>
+                          Active via: {rule.activationSources!.join(', ')}
+                        </text>
+                      </Show>
                       <Show when={(rule.metadata.globs?.length ?? 0) > 0}>
                         <text fg={props.theme.textMuted}>
                           Globs: {rule.metadata.globs!.join(', ')}

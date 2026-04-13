@@ -462,6 +462,29 @@ describe('loadSidebarRules isActive behavior', () => {
     expect(unmatched!.isActive).toBe(false);
   });
 
+  it('maps activation labels from provenance-rich active rules', async () => {
+    const globalDir = path.join(testDir, '.config', 'opencode', 'rules');
+    mkdirSync(globalDir, { recursive: true });
+    const matchedPath = path.join(globalDir, 'matched.md');
+    writeFileSync(matchedPath, '# Matched');
+    process.env['XDG_CONFIG_HOME'] = path.join(testDir, '.config');
+
+    writeActiveRulesState('test-session', [
+      {
+        ruleId: 'matched',
+        filePath: matchedPath,
+        relativePath: 'matched.md',
+        sources: ['automatic', 'manual-pinned'],
+      },
+    ]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const { rules } = await loadSidebarRules(null, 'test-session');
+
+    expect(rules[0]!.activationLabel).toBe('auto+manual');
+    expect(rules[0]!.activationSources).toEqual(['automatic', 'manual-pinned']);
+  });
+
   it('correctly matches conditional rules with state file', async () => {
     const globalDir = path.join(testDir, '.config', 'opencode', 'rules');
     mkdirSync(globalDir, { recursive: true });
@@ -508,7 +531,9 @@ function makeEntry(
 ): SidebarRuleEntry {
   return {
     name: '',
+    ruleId: overrides.ruleId ?? overrides.path,
     path: overrides.path,
+    aliases: overrides.aliases ?? [],
     source: overrides.source ?? 'global',
     isConditional: overrides.isConditional ?? false,
     conditionSummary: overrides.conditionSummary ?? 'always active',

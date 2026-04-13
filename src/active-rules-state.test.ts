@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import {
   resolveStateDir,
   getStateFilePath,
+  type ActiveRuleRecord,
   writeActiveRulesState,
   readActiveRulesState,
   _setStateDirForTesting,
@@ -93,6 +94,25 @@ describe('active-rules-state', () => {
       expect(state!.evaluatedAt).toBeLessThanOrEqual(Date.now());
     });
 
+    it('write/read round-trip preserves provenance-rich active rules', async () => {
+      const sessionId = 'ses_active_rules';
+      const activeRules: ActiveRuleRecord[] = [
+        {
+          ruleId: 'security/review',
+          filePath: '/rules/security/review.mdc',
+          relativePath: 'security/review.mdc',
+          sources: ['automatic', 'manual-pinned'],
+        },
+      ];
+
+      writeActiveRulesState(sessionId, activeRules);
+      await waitForFile(getStateFilePath(sessionId));
+
+      const state = await readActiveRulesState(sessionId);
+      expect(state?.matchedRulePaths).toEqual(['/rules/security/review.mdc']);
+      expect(state?.activeRules).toEqual(activeRules);
+    });
+
     it('returns null for missing file', async () => {
       const state = await readActiveRulesState('ses_nonexistent');
       expect(state).toBeNull();
@@ -151,6 +171,32 @@ describe('active-rules-state', () => {
       );
 
       const state = await readActiveRulesState('ses_badarray');
+      expect(state).toBeNull();
+    });
+
+    it('returns null for invalid activeRules source values', async () => {
+      await fs.mkdir(testStateDir, { recursive: true });
+
+      const filePath = getStateFilePath('ses_bad_sources');
+      await fs.writeFile(
+        filePath,
+        JSON.stringify({
+          sessionId: 'ses_bad_sources',
+          matchedRulePaths: ['/valid.md'],
+          activeRules: [
+            {
+              ruleId: 'valid',
+              filePath: '/valid.md',
+              relativePath: 'valid.md',
+              sources: ['nope'],
+            },
+          ],
+          evaluatedAt: Date.now(),
+        }),
+        'utf-8'
+      );
+
+      const state = await readActiveRulesState('ses_bad_sources');
       expect(state).toBeNull();
     });
 

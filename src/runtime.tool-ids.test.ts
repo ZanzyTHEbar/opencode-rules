@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { OpenCodeRulesRuntime } from './runtime.js';
+import { RuleRegistry } from './rule-registry.js';
 import { SessionStore } from './session-store.js';
 import * as runtimeModule from './runtime.js';
 import * as runtimeContextModule from './runtime-context.js';
@@ -50,6 +51,7 @@ describe('OpenCodeRulesRuntime.queryAvailableToolIDs', () => {
       directory: '/tmp',
       projectDirectory: '/tmp',
       ruleFiles: [],
+      ruleRegistry: new RuleRegistry([]),
       sessionStore: new SessionStore({ max: 10 }),
       debugLog: () => {},
     });
@@ -68,6 +70,7 @@ describe('OpenCodeRulesRuntime.queryAvailableToolIDs', () => {
       directory: '/tmp',
       projectDirectory: '/tmp',
       ruleFiles: [],
+      ruleRegistry: new RuleRegistry([]),
       sessionStore: new SessionStore({ max: 10 }),
       debugLog: () => {},
     });

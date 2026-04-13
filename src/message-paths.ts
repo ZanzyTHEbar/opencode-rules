@@ -92,7 +92,7 @@ function extractPathsFromToolCall(
 /**
  * Extract directory path from a glob pattern
  */
-function extractDirFromGlob(pattern: string): string | null {
+export function extractDirFromGlob(pattern: string): string | null {
   // Find the first glob character
   const globChars = ['*', '?', '[', '{'];
   let firstGlobIndex = pattern.length;

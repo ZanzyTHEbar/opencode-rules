@@ -7,6 +7,7 @@
 import type { Plugin, PluginInput } from '@opencode-ai/plugin';
 import { discoverRuleFiles } from './utils.js';
 import { OpenCodeRulesRuntime } from './runtime.js';
+import { RuleRegistry } from './rule-registry.js';
 import { createSessionStore, type SessionState } from './session-store.js';
 
 const sessionStore = createSessionStore();
@@ -16,6 +17,7 @@ const debugLog = createDebugLog();
 
 const openCodeRulesPlugin = async (pluginInput: PluginInput) => {
   const ruleFiles = await discoverRuleFiles(pluginInput.directory);
+  const ruleRegistry = new RuleRegistry(ruleFiles);
   debugLog(`Discovered ${ruleFiles.length} rule file(s)`);
 
   const runtime = new OpenCodeRulesRuntime({
@@ -23,6 +25,7 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput) => {
     directory: pluginInput.directory,
     projectDirectory: pluginInput.directory,
     ruleFiles,
+    ruleRegistry,
     sessionStore,
     debugLog,
   });

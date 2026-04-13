@@ -6,12 +6,15 @@ export interface MessagePartWithSession {
   text?: string;
   sessionID?: string;
   synthetic?: boolean;
+  ignored?: boolean;
 }
 
 export interface MessageWithInfo {
   role?: string;
   parts?: MessagePartWithSession[];
   info?: {
+    id?: string;
+    role?: string;
     sessionID?: string;
   };
 }
@@ -22,11 +25,16 @@ export interface MessageWithInfo {
  * Returns an empty string if no text is extracted.
  */
 export function extractTextFromParts(
-  parts: Array<{ type?: string; text?: string; synthetic?: boolean }>
+  parts: Array<{
+    type?: string;
+    text?: string;
+    synthetic?: boolean;
+    ignored?: boolean;
+  }>
 ): string {
   const textParts: string[] = [];
   for (const part of parts) {
-    if (part.synthetic) continue;
+    if (part.synthetic || part.ignored) continue;
 
     if (part.type === 'text' && part.text) {
       textParts.push(part.text);
@@ -90,7 +98,8 @@ export function extractLatestUserPrompt(
 ): string | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    if (message.role && message.role !== 'user') continue;
+    const role = message.role ?? message.info?.role;
+    if (role && role !== 'user') continue;
     const parts = message.parts || [];
 
     const userPrompt = extractTextFromParts(parts);
@@ -109,13 +118,14 @@ export function extractLatestUserPrompt(
 export function toExtractableMessages(messages: MessageWithInfo[]): Message[] {
   const result: Message[] = [];
   for (const msg of messages) {
+    const role = msg.role ?? msg.info?.role;
     if (
-      typeof msg.role === 'string' &&
+      typeof role === 'string' &&
       Array.isArray(msg.parts) &&
       msg.parts.length > 0
     ) {
       result.push({
-        role: msg.role,
+        role,
         parts: msg.parts as MessagePart[],
       });
     }

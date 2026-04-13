@@ -1,8 +1,17 @@
-import { readAndFormatRules, type RuleFilterContext } from './rule-filter.js';
+import {
+  formatMergedRulesForPrompt,
+  mergeRuleSelections,
+  type ActiveRule,
+} from './rule-selection.js';
+import {
+  readMatchingRules,
+  type MatchedRule,
+  type RuleFilterContext,
+} from './rule-filter.js';
 import { extractFilePathsFromMessages } from './message-paths.js';
+import { extractDirFromGlob } from './message-paths.js';
 import { type DiscoveredRule } from './rule-discovery.js';
 import {
-  extractLatestUserPrompt,
   extractSessionID,
   normalizeContextPath,
   sanitizePathForContext,
@@ -21,7 +30,24 @@ import {
   type ChatMessageInput,
   type ChatMessageOutput,
 } from './runtime-chat.js';
-import { writeActiveRulesState } from './active-rules-state.js';
+import {
+  writeActiveRulesState,
+  type ActiveRuleRecord,
+} from './active-rules-state.js';
+import { parseInlineRuleReferences } from './manual-rule-refs.js';
+import { RuleRegistry } from './rule-registry.js';
+import {
+  formatActiveRules,
+  formatOrulesHelp,
+  formatResolutionProblems,
+  formatRuleDetails,
+  formatRuleList,
+  parseOrulesCommand,
+} from './orules-command.js';
+import {
+  buildRuleCompletionSuffix,
+  detectRuleCompletionRequest,
+} from './text-completion.js';
 
 interface MessagesTransformOutput {
   messages: MessageWithInfo[];
@@ -35,21 +61,56 @@ interface SystemTransformOutput {
   system?: string | string[];
 }
 
+interface CommandExecuteInput {
+  command?: string;
+  sessionID?: string;
+  arguments?: string;
+}
+
+interface CommandExecuteOutput {
+  parts?: Array<{ type?: string; text?: string; ignored?: boolean }>;
+}
+
+interface ConfigCommandDefinition {
+  template: string;
+  description?: string;
+  agent?: string;
+  model?: string;
+  subtask?: boolean;
+}
+
+interface ConfigHookInput {
+  command?: Record<string, ConfigCommandDefinition>;
+}
+
+interface TextCompleteInput {
+  sessionID?: string;
+  messageID?: string;
+  partID?: string;
+}
+
+interface TextCompleteOutput {
+  text: string;
+}
+
 interface OpenCodeRulesRuntimeOptions {
   client: unknown;
   directory: string;
   projectDirectory: string;
   ruleFiles: DiscoveredRule[];
+  ruleRegistry: RuleRegistry;
   sessionStore: SessionStore;
   debugLog?: DebugLog;
   now?: () => number;
 }
 
 export class OpenCodeRulesRuntime {
+  private readonly processedInlineParts = new WeakSet<object>();
   private client: unknown;
   private directory: string;
   private projectDirectory: string;
   private ruleFiles: DiscoveredRule[];
+  private ruleRegistry: RuleRegistry;
   private sessionStore: SessionStore;
   private debugLog: DebugLog;
   private now: () => number;
@@ -59,6 +120,7 @@ export class OpenCodeRulesRuntime {
     this.directory = opts.directory;
     this.projectDirectory = opts.projectDirectory;
     this.ruleFiles = opts.ruleFiles;
+    this.ruleRegistry = opts.ruleRegistry;
     this.sessionStore = opts.sessionStore;
     this.debugLog = opts.debugLog ?? createDebugLog();
     this.now = opts.now ?? (() => Date.now());
@@ -66,12 +128,23 @@ export class OpenCodeRulesRuntime {
 
   createHooks(): Record<string, unknown> {
     return {
+      config: this.onConfig.bind(this),
+      'command.execute.before': this.onCommandExecuteBefore.bind(this),
       'tool.execute.before': this.onToolExecuteBefore.bind(this),
       'experimental.chat.messages.transform':
         this.onMessagesTransform.bind(this),
       'chat.message': this.onChatMessage.bind(this),
       'experimental.chat.system.transform': this.onSystemTransform.bind(this),
       'experimental.session.compacting': this.onSessionCompacting.bind(this),
+      'experimental.text.complete': this.onTextComplete.bind(this),
+    };
+  }
+
+  private async onConfig(input: ConfigHookInput): Promise<void> {
+    input.command ??= {};
+    input.command['orules'] = {
+      template: '',
+      description: 'Manage and inspect OpenCode rules',
     };
   }
 
@@ -95,9 +168,12 @@ export class OpenCodeRulesRuntime {
         filePath = arg;
       }
     } else if (['glob', 'grep'].includes(toolName)) {
-      const arg = args.path;
-      if (typeof arg === 'string' && arg.length > 0) {
-        filePath = arg;
+      const pathArg = args.path;
+      const patternArg = args.pattern;
+      if (typeof pathArg === 'string' && pathArg.length > 0) {
+        filePath = pathArg;
+      } else if (toolName === 'glob' && typeof patternArg === 'string') {
+        filePath = extractDirFromGlob(patternArg) ?? undefined;
       }
     } else if (toolName === 'bash') {
       const arg = args.workdir;
@@ -129,39 +205,82 @@ export class OpenCodeRulesRuntime {
     }
 
     const existingState = this.sessionStore.get(sessionID);
-    if (existingState && existingState.seededFromHistory) {
+
+    if (!existingState?.seededFromHistory) {
+      const contextPaths = extractFilePathsFromMessages(
+        toExtractableMessages(output.messages)
+      );
+
+      this.sessionStore.upsert(sessionID, state => {
+        for (const p of contextPaths) {
+          state.contextPaths.add(
+            normalizeContextPath(p, this.projectDirectory)
+          );
+        }
+        state.seededFromHistory = true;
+        state.seedCount = (state.seedCount ?? 0) + 1;
+      });
+
+      if (contextPaths.length > 0) {
+        this.debugLog(
+          `Seeded ${contextPaths.length} context path(s) for session ${sessionID}: ${contextPaths
+            .slice(0, 5)
+            .join(', ')}${contextPaths.length > 5 ? '...' : ''}`
+        );
+      }
+    } else {
       this.debugLog(`Session ${sessionID} already seeded, skipping rescan`);
-      return output;
     }
 
-    const contextPaths = extractFilePathsFromMessages(
-      toExtractableMessages(output.messages)
-    );
-    const userPrompt = extractLatestUserPrompt(output.messages);
-
-    this.sessionStore.upsert(sessionID, state => {
-      for (const p of contextPaths) {
-        state.contextPaths.add(normalizeContextPath(p, this.projectDirectory));
-      }
-      if (userPrompt && !state.lastUserPrompt) {
-        state.lastUserPrompt = userPrompt;
-      }
-      state.seededFromHistory = true;
-      state.seedCount = (state.seedCount ?? 0) + 1;
-    });
-
-    if (contextPaths.length > 0) {
-      this.debugLog(
-        `Seeded ${contextPaths.length} context path(s) for session ${sessionID}: ${contextPaths
-          .slice(0, 5)
-          .join(', ')}${contextPaths.length > 5 ? '...' : ''}`
+    const latestUserMessage = this.findLatestUserTextMessage(output.messages);
+    if (latestUserMessage) {
+      const { messageID, text } = latestUserMessage;
+      const parsed = parseInlineRuleReferences(text);
+      const shouldUpdateText = parsed.strippedText !== text;
+      const shouldProcessInlineRefs =
+        parsed.references.length > 0 &&
+        (messageID
+          ? existingState?.lastProcessedInlineMessageID !== messageID
+          : !this.processedInlineParts.has(latestUserMessage.part));
+      const shouldClearStaleInlineRefs = Boolean(
+        existingState &&
+        existingState.pendingInlineRuleIDs.size > 0 &&
+        parsed.references.length === 0 &&
+        (messageID
+          ? existingState.lastProcessedInlineMessageID !== messageID
+          : existingState.lastUserPrompt !== parsed.strippedText)
       );
-    }
 
-    if (userPrompt) {
-      this.debugLog(
-        `Seeded user prompt for session ${sessionID} (len=${userPrompt.length})`
-      );
+      if (
+        shouldUpdateText ||
+        shouldProcessInlineRefs ||
+        shouldClearStaleInlineRefs ||
+        existingState?.lastUserPrompt !== parsed.strippedText
+      ) {
+        this.sessionStore.upsert(sessionID, state => {
+          state.lastUserPrompt = parsed.strippedText;
+
+          if (shouldClearStaleInlineRefs) {
+            state.pendingInlineRuleIDs.clear();
+          }
+
+          if (shouldProcessInlineRefs) {
+            for (const reference of parsed.references) {
+              state.pendingInlineRuleIDs.add(reference);
+            }
+            if (messageID) {
+              state.lastProcessedInlineMessageID = messageID;
+            } else {
+              this.processedInlineParts.add(latestUserMessage.part);
+            }
+            state.rulesInjected = false;
+          }
+        });
+      }
+
+      if (shouldUpdateText) {
+        latestUserMessage.part.text = parsed.strippedText;
+      }
     }
 
     return output;
@@ -225,17 +344,44 @@ export class OpenCodeRulesRuntime {
       this.debugLog
     );
 
-    const { formattedRules, matchedPaths } = await readAndFormatRules(
+    const automaticRules = await readMatchingRules(
       this.ruleFiles,
       filterContext
     );
 
+    const manualPinnedRules = sessionState
+      ? await this.resolveManualRuleIDs(
+          Array.from(sessionState.manualPinnedRuleIDs)
+        )
+      : [];
+    const inlineRules = sessionState
+      ? await this.resolveManualRuleIDs(
+          Array.from(sessionState.pendingInlineRuleIDs)
+        )
+      : [];
+
+    const mergedRules = mergeRuleSelections([
+      { source: 'automatic', rules: automaticRules },
+      { source: 'manual-pinned', rules: manualPinnedRules },
+      { source: 'manual-inline', rules: inlineRules },
+    ]);
+
+    const formattedRules = formatMergedRulesForPrompt(mergedRules);
+    const activeRuleRecords = mergedRules.map(rule =>
+      this.toActiveRuleRecord(rule)
+    );
+
     if (sessionID) {
-      writeActiveRulesState(sessionID, matchedPaths);
+      writeActiveRulesState(sessionID, activeRuleRecords);
     }
 
     if (!formattedRules) {
       this.debugLog('No applicable rules for current context');
+      if (sessionID) {
+        this.sessionStore.upsert(sessionID, state => {
+          state.pendingInlineRuleIDs.clear();
+        });
+      }
       return output ?? {};
     }
 
@@ -244,6 +390,7 @@ export class OpenCodeRulesRuntime {
     if (!output) {
       if (sessionID) {
         this.sessionStore.upsert(sessionID, state => {
+          state.pendingInlineRuleIDs.clear();
           state.rulesInjected = true;
           state.lastInjectedAt = this.now();
         });
@@ -261,12 +408,305 @@ export class OpenCodeRulesRuntime {
 
     if (sessionID) {
       this.sessionStore.upsert(sessionID, state => {
+        state.pendingInlineRuleIDs.clear();
         state.rulesInjected = true;
         state.lastInjectedAt = this.now();
       });
     }
 
     return output;
+  }
+
+  private async onCommandExecuteBefore(
+    input: CommandExecuteInput,
+    output: CommandExecuteOutput
+  ): Promise<void> {
+    if (input.command !== 'orules' || !input.sessionID) {
+      return;
+    }
+
+    const sessionID = input.sessionID;
+    const sessionState = this.sessionStore.get(sessionID);
+    const parsed = parseOrulesCommand(input.arguments ?? '');
+    const activeRules = await this.computeCurrentActiveRules(sessionID);
+    let responseText = formatOrulesHelp();
+
+    if (parsed.subcommand === 'help') {
+      responseText = formatOrulesHelp();
+    } else if (parsed.subcommand === 'list') {
+      const query = parsed.args.join(' ').trim();
+      const matches = await this.ruleRegistry.search(query || undefined);
+      responseText = formatRuleList(matches, {
+        activeRuleIDs: new Set(activeRules.map(rule => rule.ruleId)),
+        pinnedRuleIDs: new Set(
+          sessionState ? Array.from(sessionState.manualPinnedRuleIDs) : []
+        ),
+        ...(query ? { query } : {}),
+      });
+    } else if (parsed.subcommand === 'active') {
+      responseText = formatActiveRules(activeRules);
+    } else if (parsed.subcommand === 'show') {
+      const target = parsed.args[0];
+      if (!target) {
+        responseText = 'Usage: /orules show <rule-id>';
+      } else {
+        const resolved = await this.ruleRegistry.resolve(target);
+        if (resolved.entry) {
+          const activeRule = activeRules.find(
+            rule => rule.ruleId === resolved.entry!.ruleId
+          );
+          responseText = formatRuleDetails(resolved.entry, activeRule);
+        } else {
+          responseText =
+            formatResolutionProblems(
+              resolved.reason === 'missing' ? [target] : [],
+              resolved.reason === 'ambiguous' && resolved.matches
+                ? [{ query: target, matches: resolved.matches }]
+                : []
+            ) ?? `Rule not found: ${target}`;
+        }
+      }
+    } else if (parsed.subcommand === 'activate') {
+      const resolution = await this.ruleRegistry.resolveMany(parsed.args);
+      if (resolution.resolved.length > 0) {
+        this.sessionStore.upsert(sessionID, state => {
+          for (const entry of resolution.resolved) {
+            state.manualPinnedRuleIDs.add(entry.ruleId);
+          }
+          state.rulesInjected = false;
+        });
+      }
+
+      const lines = [
+        resolution.resolved.length > 0
+          ? `Pinned ${resolution.resolved.length} rule(s).`
+          : 'No rules were pinned.',
+      ];
+      const problems = formatResolutionProblems(
+        resolution.missing,
+        resolution.ambiguous
+      );
+      if (resolution.resolved.length > 0) {
+        lines.push(...resolution.resolved.map(rule => `- ${rule.ruleId}`));
+      }
+      if (problems) {
+        lines.push('', problems);
+      }
+      responseText = lines.join('\n');
+    } else if (parsed.subcommand === 'deactivate') {
+      if (parsed.args.length === 0) {
+        responseText = 'Usage: /orules deactivate <rule-id> [rule-id...]';
+      } else {
+        const resolution = await this.ruleRegistry.resolveMany(parsed.args);
+        const removed: string[] = [];
+        this.sessionStore.upsert(sessionID, state => {
+          for (const entry of resolution.resolved) {
+            if (state.manualPinnedRuleIDs.delete(entry.ruleId)) {
+              removed.push(entry.ruleId);
+            }
+          }
+          state.rulesInjected = false;
+        });
+
+        const problems = formatResolutionProblems(
+          resolution.missing,
+          resolution.ambiguous
+        );
+        responseText = [
+          removed.length > 0
+            ? `Unpinned ${removed.length} rule(s).`
+            : 'No pinned rules were removed.',
+          ...removed.map(ruleId => `- ${ruleId}`),
+          ...(problems ? ['', problems] : []),
+        ].join('\n');
+      }
+    } else if (parsed.subcommand === 'clear') {
+      const cleared = sessionState?.manualPinnedRuleIDs.size ?? 0;
+      this.sessionStore.upsert(sessionID, state => {
+        state.manualPinnedRuleIDs.clear();
+        state.rulesInjected = false;
+      });
+      responseText = `Cleared ${cleared} pinned rule(s).`;
+    } else {
+      responseText = `Unknown /orules subcommand: ${parsed.subcommand}\n\n${formatOrulesHelp()}`;
+    }
+
+    await this.sendIgnoredSessionMessage(sessionID, responseText);
+
+    output.parts = output.parts ?? [];
+    throw new Error('__ORULES_COMMAND_HANDLED__');
+  }
+
+  private async onTextComplete(
+    input: TextCompleteInput,
+    output: TextCompleteOutput
+  ): Promise<void> {
+    if (!input.sessionID || !input.messageID || !input.partID) {
+      return;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client = this.client as any;
+    const result = await client.session?.message?.({
+      path: { id: input.sessionID, messageID: input.messageID },
+    });
+    const parts = result?.data?.parts;
+    if (!Array.isArray(parts)) {
+      return;
+    }
+
+    const currentPart = parts.find(
+      (part: { id?: string; type?: string; text?: string }) =>
+        part.id === input.partID &&
+        (part.type === 'text' || part.type === undefined)
+    );
+    if (!currentPart || typeof currentPart.text !== 'string') {
+      return;
+    }
+
+    const request = detectRuleCompletionRequest(currentPart.text);
+    if (!request) {
+      return;
+    }
+
+    const matches = await this.ruleRegistry.completePrefix(request.prefix);
+    if (matches.length !== 1) {
+      return;
+    }
+
+    const suffix = buildRuleCompletionSuffix(
+      request.prefix,
+      matches[0],
+      request.suffix
+    );
+    if (suffix) {
+      output.text = suffix;
+    }
+  }
+
+  private findLatestUserTextMessage(messages: MessageWithInfo[]): {
+    messageID?: string;
+    part: { text?: string; ignored?: boolean };
+    text: string;
+  } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      const role = message.role ?? message.info?.role;
+      if (role !== 'user' || !Array.isArray(message.parts)) {
+        continue;
+      }
+
+      for (let j = message.parts.length - 1; j >= 0; j--) {
+        const part = message.parts[j];
+        if (part.ignored || part.synthetic) continue;
+        if (
+          (part.type === 'text' || part.type === undefined) &&
+          typeof part.text === 'string'
+        ) {
+          return {
+            part,
+            text: part.text,
+            ...(message.info?.id ? { messageID: message.info.id } : {}),
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private async resolveManualRuleIDs(
+    references: string[]
+  ): Promise<MatchedRule[]> {
+    if (references.length === 0) {
+      return [];
+    }
+
+    const resolution = await this.ruleRegistry.resolveMany(references);
+    return resolution.resolved.map(entry => ({
+      filePath: entry.filePath,
+      relativePath: entry.relativePath,
+      ruleId: entry.ruleId,
+      content: entry.content,
+      metadata: entry.metadata,
+    }));
+  }
+
+  private toActiveRuleRecord(rule: ActiveRule): ActiveRuleRecord {
+    return {
+      ruleId: rule.ruleId,
+      filePath: rule.filePath,
+      relativePath: rule.relativePath,
+      sources: [...rule.sources],
+    };
+  }
+
+  private async computeCurrentActiveRules(
+    sessionID: string
+  ): Promise<ActiveRule[]> {
+    const sessionState = this.sessionStore.get(sessionID);
+    if (!sessionState) {
+      return [];
+    }
+
+    const availableToolIDs = await this.queryAvailableToolIDs();
+    const filterContextOpts: BuildFilterContextOptions = {
+      contextFilePaths: Array.from(sessionState.contextPaths).sort((a, b) =>
+        a.localeCompare(b)
+      ),
+      userPrompt: sessionState.lastUserPrompt,
+      availableToolIDs,
+      modelID: sessionState.lastModelID,
+      agentType: sessionState.lastAgentType,
+    };
+
+    const filterContext = await buildFilterContext(
+      filterContextOpts,
+      this.projectDirectory,
+      this.debugLog
+    );
+
+    const automaticRules = await readMatchingRules(
+      this.ruleFiles,
+      filterContext
+    );
+    const manualPinnedRules = await this.resolveManualRuleIDs(
+      Array.from(sessionState.manualPinnedRuleIDs)
+    );
+    const inlineRules = await this.resolveManualRuleIDs(
+      Array.from(sessionState.pendingInlineRuleIDs)
+    );
+
+    return mergeRuleSelections([
+      { source: 'automatic', rules: automaticRules },
+      { source: 'manual-pinned', rules: manualPinnedRules },
+      { source: 'manual-inline', rules: inlineRules },
+    ]);
+  }
+
+  private async sendIgnoredSessionMessage(
+    sessionID: string,
+    text: string
+  ): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client = this.client as any;
+    if (!client.session?.prompt) {
+      return;
+    }
+
+    await client.session.prompt({
+      path: { id: sessionID },
+      body: {
+        noReply: true,
+        parts: [
+          {
+            type: 'text',
+            text,
+            ignored: true,
+          },
+        ],
+      },
+    });
   }
 
   private async queryAvailableToolIDs(): Promise<string[]> {

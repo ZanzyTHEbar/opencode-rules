@@ -121,6 +121,14 @@ describe('extractTextFromParts', () => {
     expect(extractTextFromParts(parts)).toBe('');
   });
 
+  it('skips ignored parts', () => {
+    const parts = [
+      { type: 'text', text: 'show', ignored: true },
+      { type: 'text', text: 'visible' },
+    ];
+    expect(extractTextFromParts(parts)).toBe('visible');
+  });
+
   it('trims and filters whitespace-only text', () => {
     const parts = [
       { type: 'text', text: '  hello  ' },

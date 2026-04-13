@@ -133,7 +133,10 @@ async function scanDirectoryRecursively(
         results.push(...(await scanDirectoryRecursively(fullPath, baseDir)));
       } else if (entry.name.endsWith('.md') || entry.name.endsWith('.mdc')) {
         // Add markdown file
-        const relativePath = path.relative(baseDir, fullPath);
+        const relativePath = path
+          .relative(baseDir, fullPath)
+          .split(path.sep)
+          .join('/');
         results.push({ filePath: fullPath, relativePath });
       }
     }

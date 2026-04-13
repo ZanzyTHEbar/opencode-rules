@@ -8,6 +8,7 @@ const { parse: parseYaml } = await import('yaml');
  * Metadata extracted from .mdc file frontmatter
  */
 export interface RuleMetadata {
+  aliases?: string[];
   globs?: string[];
   keywords?: string[];
   tools?: string[];
@@ -25,6 +26,7 @@ export interface RuleMetadata {
  * Raw parsed YAML frontmatter structure
  */
 interface ParsedFrontmatter {
+  aliases?: unknown;
   globs?: unknown;
   keywords?: unknown;
   tools?: unknown;
@@ -40,6 +42,7 @@ interface ParsedFrontmatter {
 
 /** Field names in ParsedFrontmatter that are string arrays */
 type StringArrayField =
+  | 'aliases'
   | 'globs'
   | 'keywords'
   | 'tools'
@@ -101,6 +104,7 @@ export function parseRuleMetadata(content: string): RuleMetadata | undefined {
 
     // Array fields to extract using shared helper
     const arrayFields: StringArrayField[] = [
+      'aliases',
       'globs',
       'keywords',
       'tools',

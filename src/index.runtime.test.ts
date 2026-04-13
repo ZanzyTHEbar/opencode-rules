@@ -216,6 +216,8 @@ describe('OpenCodeRulesPlugin', () => {
     );
     expect(hooks).toHaveProperty('experimental.chat.messages.transform');
     expect(hooks).toHaveProperty('experimental.chat.system.transform');
+    expect(hooks).toHaveProperty('command.execute.before');
+    expect(hooks).toHaveProperty('experimental.text.complete');
     expect(typeof hooks['experimental.chat.messages.transform']).toBe(
       'function'
     );
@@ -384,6 +386,267 @@ describe('OpenCodeRulesPlugin', () => {
     await transform({}, messages);
 
     expect(__testOnly.getSeedCount('ses_seed')).toBe(1);
+  });
+
+  it('strips inline rule refs and applies them for one turn only', async () => {
+    const { testDir, globalRulesDir } = getTestDirs();
+    writeFileSync(
+      path.join(globalRulesDir, 'security.mdc'),
+      `---\naliases:\n  - secure\n---\nUse security steps.`
+    );
+    process.env.XDG_CONFIG_HOME = path.join(testDir, '.config');
+
+    const {
+      default: { server: plugin },
+    } = await import('./index.js');
+    const mockInput = createMockPluginInput({ testDir });
+    const hooks = await plugin(
+      mockInput as unknown as Parameters<typeof plugin>[0]
+    );
+
+    const transform = hooks['experimental.chat.messages.transform'] as (
+      input: unknown,
+      output: { messages: Array<Record<string, unknown>> }
+    ) => Promise<{ messages: Array<Record<string, unknown>> }>;
+
+    const messages = {
+      messages: [
+        {
+          role: 'user',
+          info: { id: 'msg_inline', role: 'user', sessionID: 'ses_inline' },
+          parts: [
+            {
+              sessionID: 'ses_inline',
+              type: 'text',
+              text: 'Please review [[orule:secure]] now',
+            },
+          ],
+        },
+      ],
+    };
+
+    const transformed = await transform({}, messages);
+    const userPart = transformed.messages[0]?.parts?.[0] as { text?: string };
+    expect(userPart?.text).toBe('Please review now');
+
+    const systemTransform = hooks['experimental.chat.system.transform'] as (
+      input: { sessionID?: string },
+      output: { system: string }
+    ) => Promise<{ system: string }>;
+
+    const firstResult = await systemTransform(
+      { sessionID: 'ses_inline' },
+      { system: 'Base prompt.' }
+    );
+    expect(firstResult.system).toContain('Use security steps');
+
+    const secondResult = await systemTransform(
+      { sessionID: 'ses_inline' },
+      { system: 'Base prompt.' }
+    );
+    expect(secondResult.system).toBe('Base prompt.');
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const state = await readActiveRulesState('ses_inline');
+    expect(state?.activeRules?.[0]?.sources).toContain('manual-inline');
+  });
+
+  it('applies inline rule refs once even without message ids', async () => {
+    const { testDir, globalRulesDir } = getTestDirs();
+    writeFileSync(
+      path.join(globalRulesDir, 'security.mdc'),
+      `---\naliases:\n  - secure\n---\nUse security steps.`
+    );
+    process.env.XDG_CONFIG_HOME = path.join(testDir, '.config');
+
+    const {
+      default: { server: plugin },
+    } = await import('./index.js');
+    const mockInput = createMockPluginInput({ testDir });
+    const hooks = await plugin(
+      mockInput as unknown as Parameters<typeof plugin>[0]
+    );
+
+    const transform = hooks['experimental.chat.messages.transform'] as (
+      input: unknown,
+      output: { messages: Array<Record<string, unknown>> }
+    ) => Promise<{ messages: Array<Record<string, unknown>> }>;
+
+    const messages = {
+      messages: [
+        {
+          role: 'user',
+          info: { role: 'user', sessionID: 'ses_inline_no_id' },
+          parts: [
+            {
+              sessionID: 'ses_inline_no_id',
+              type: 'text',
+              text: 'Please review [[orule:secure]] now',
+            },
+          ],
+        },
+      ],
+    };
+
+    const transformed = await transform({}, messages);
+    const userPart = transformed.messages[0]?.parts?.[0] as { text?: string };
+    expect(userPart?.text).toBe('Please review now');
+
+    await transform({}, transformed);
+
+    const systemTransform = hooks['experimental.chat.system.transform'] as (
+      input: { sessionID?: string },
+      output: { system: string }
+    ) => Promise<{ system: string }>;
+
+    const firstResult = await systemTransform(
+      { sessionID: 'ses_inline_no_id' },
+      { system: 'Base prompt.' }
+    );
+    expect(firstResult.system).toContain('Use security steps');
+
+    const secondResult = await systemTransform(
+      { sessionID: 'ses_inline_no_id' },
+      { system: 'Base prompt.' }
+    );
+    expect(secondResult.system).toBe('Base prompt.');
+  });
+
+  it('pins and unpins rules via /orules commands', async () => {
+    const { testDir, globalRulesDir } = getTestDirs();
+    writeFileSync(
+      path.join(globalRulesDir, 'security.mdc'),
+      `---\nmodel:\n  - claude-opus\n---\nUse session security guidance.`
+    );
+    process.env.XDG_CONFIG_HOME = path.join(testDir, '.config');
+
+    const sentMessages: string[] = [];
+    const {
+      default: { server: plugin },
+    } = await import('./index.js');
+    const mockInput = createMockPluginInput({
+      testDir,
+      sessionPrompt: async input => {
+        const body = (input as { body?: { parts?: Array<{ text?: string }> } })
+          .body;
+        sentMessages.push(body?.parts?.[0]?.text ?? '');
+        return {};
+      },
+    });
+    const hooks = await plugin(
+      mockInput as unknown as Parameters<typeof plugin>[0]
+    );
+
+    const commandHook = hooks['command.execute.before'] as (
+      input: { command: string; sessionID: string; arguments: string },
+      output: { parts: unknown[] }
+    ) => Promise<void>;
+    const systemTransform = hooks['experimental.chat.system.transform'] as (
+      input: { sessionID?: string },
+      output: { system: string }
+    ) => Promise<{ system: string }>;
+
+    await expect(
+      commandHook(
+        {
+          command: 'orules',
+          sessionID: 'ses_cmd',
+          arguments: 'activate security',
+        },
+        { parts: [] }
+      )
+    ).rejects.toThrow('__ORULES_COMMAND_HANDLED__');
+    expect(sentMessages.at(-1)).toContain('Pinned 1 rule(s).');
+
+    const activeResult = await systemTransform(
+      { sessionID: 'ses_cmd' },
+      { system: 'Base prompt.' }
+    );
+    expect(activeResult.system).toContain('Use session security guidance.');
+
+    await expect(
+      commandHook(
+        {
+          command: 'orules',
+          sessionID: 'ses_cmd',
+          arguments: 'deactivate security',
+        },
+        { parts: [] }
+      )
+    ).rejects.toThrow('__ORULES_COMMAND_HANDLED__');
+
+    await hooks['chat.message']?.(
+      { sessionID: 'ses_cmd', model: { modelID: 'gpt-5' } },
+      {
+        message: { role: 'user' },
+        parts: [{ type: 'text', text: 'fresh turn' }],
+      }
+    );
+
+    const inactiveResult = await systemTransform(
+      { sessionID: 'ses_cmd' },
+      { system: 'Base prompt.' }
+    );
+    expect(inactiveResult.system).toBe('Base prompt.');
+  });
+
+  it('completes inline and command rule references', async () => {
+    const { testDir, globalRulesDir } = getTestDirs();
+    writeFileSync(
+      path.join(globalRulesDir, 'security-review.mdc'),
+      'Use security review guidance.'
+    );
+    process.env.XDG_CONFIG_HOME = path.join(testDir, '.config');
+
+    const {
+      default: { server: plugin },
+    } = await import('./index.js');
+    const mockInput = createMockPluginInput({
+      testDir,
+      sessionMessage: async input => {
+        const messageID = (input as { path: { messageID: string } }).path
+          .messageID;
+        const text =
+          messageID === 'msg_inline_complete'
+            ? 'Use [[orule:security-rev'
+            : '/orules show security-rev';
+        return {
+          data: {
+            info: { id: messageID, role: 'user' },
+            parts: [{ id: 'part_1', type: 'text', text }],
+          },
+        };
+      },
+    });
+    const hooks = await plugin(
+      mockInput as unknown as Parameters<typeof plugin>[0]
+    );
+    const complete = hooks['experimental.text.complete'] as (
+      input: { sessionID: string; messageID: string; partID: string },
+      output: { text: string }
+    ) => Promise<void>;
+
+    const inlineOutput = { text: '' };
+    await complete(
+      {
+        sessionID: 'ses_complete',
+        messageID: 'msg_inline_complete',
+        partID: 'part_1',
+      },
+      inlineOutput
+    );
+    expect(inlineOutput.text).toBe('iew]]');
+
+    const commandOutput = { text: '' };
+    await complete(
+      {
+        sessionID: 'ses_complete',
+        messageID: 'msg_command_complete',
+        partID: 'part_1',
+      },
+      commandOutput
+    );
+    expect(commandOutput.text).toBe('iew');
   });
 });
 

@@ -1,5 +1,7 @@
 export interface SessionState {
   contextPaths: Set<string>;
+  manualPinnedRuleIDs: Set<string>;
+  pendingInlineRuleIDs: Set<string>;
   lastUserPrompt?: string;
   lastUpdated: number;
   isCompacting?: boolean;
@@ -8,6 +10,7 @@ export interface SessionState {
   seedCount?: number;
   lastModelID?: string;
   lastAgentType?: string;
+  lastProcessedInlineMessageID?: string;
   rulesInjected?: boolean;
   lastInjectedAt?: number;
 }
@@ -43,6 +46,8 @@ export class SessionStore {
     return {
       ...s,
       contextPaths: new Set(s.contextPaths),
+      manualPinnedRuleIDs: new Set(s.manualPinnedRuleIDs),
+      pendingInlineRuleIDs: new Set(s.pendingInlineRuleIDs),
     };
   }
 
@@ -117,6 +122,8 @@ export class SessionStore {
     // Match existing semantics: tick increments on creation, then again on upsert.
     return {
       contextPaths: new Set<string>(),
+      manualPinnedRuleIDs: new Set<string>(),
+      pendingInlineRuleIDs: new Set<string>(),
       lastUpdated: ++this.tick,
       seededFromHistory: false,
       seedCount: 0,

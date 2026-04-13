@@ -6,9 +6,19 @@ import { createDebugLog } from './debug.js';
 
 const debugLog = createDebugLog();
 
+export type ActiveRuleSource = 'automatic' | 'manual-inline' | 'manual-pinned';
+
+export interface ActiveRuleRecord {
+  ruleId: string;
+  filePath: string;
+  relativePath: string;
+  sources: ActiveRuleSource[];
+}
+
 export interface ActiveRulesState {
   sessionId: string;
   matchedRulePaths: string[];
+  activeRules?: ActiveRuleRecord[];
   evaluatedAt: number;
 }
 
@@ -46,25 +56,45 @@ export function getStateFilePath(sessionId: string): string {
 
 export function writeActiveRulesState(
   sessionId: string,
-  matchedPaths: string[]
+  activeRulesOrMatchedPaths: string[] | ActiveRuleRecord[]
 ): void {
   if (!isValidSessionId(sessionId)) {
     debugLog(`Invalid sessionId rejected: ${sessionId}`);
     return;
   }
 
+  const activeRules = Array.isArray(activeRulesOrMatchedPaths)
+    ? activeRulesOrMatchedPaths.filter(
+        (item): item is ActiveRuleRecord => typeof item === 'object'
+      )
+    : [];
+
+  const matchedPaths =
+    activeRules.length > 0 &&
+    activeRules.length === activeRulesOrMatchedPaths.length
+      ? activeRules.map(rule => rule.filePath)
+      : (activeRulesOrMatchedPaths as string[]);
+
   const state: ActiveRulesState = {
     sessionId,
     matchedRulePaths: matchedPaths,
+    ...(activeRules.length > 0 ? { activeRules } : {}),
     evaluatedAt: Date.now(),
   };
 
   // Chain onto existing queue for this session, or start fresh
   const previousWrite = writeQueues.get(sessionId) ?? Promise.resolve();
 
-  const currentWrite = previousWrite.then(async () => {
-    await doAtomicWrite(sessionId, state);
-  });
+  let currentWrite: Promise<void>;
+  currentWrite = previousWrite
+    .then(async () => {
+      await doAtomicWrite(sessionId, state);
+    })
+    .finally(() => {
+      if (writeQueues.get(sessionId) === currentWrite) {
+        writeQueues.delete(sessionId);
+      }
+    });
 
   writeQueues.set(sessionId, currentWrite);
 
@@ -159,6 +189,38 @@ function isValidActiveRulesState(value: unknown): value is ActiveRulesState {
   for (const item of obj['matchedRulePaths']) {
     if (typeof item !== 'string') {
       return false;
+    }
+  }
+
+  if (obj['activeRules'] !== undefined) {
+    if (!Array.isArray(obj['activeRules'])) {
+      return false;
+    }
+
+    for (const item of obj['activeRules']) {
+      if (typeof item !== 'object' || item === null) {
+        return false;
+      }
+
+      const rule = item as Record<string, unknown>;
+      if (
+        typeof rule['ruleId'] !== 'string' ||
+        typeof rule['filePath'] !== 'string' ||
+        typeof rule['relativePath'] !== 'string' ||
+        !Array.isArray(rule['sources'])
+      ) {
+        return false;
+      }
+
+      for (const source of rule['sources']) {
+        if (
+          source !== 'automatic' &&
+          source !== 'manual-inline' &&
+          source !== 'manual-pinned'
+        ) {
+          return false;
+        }
+      }
     }
   }
 

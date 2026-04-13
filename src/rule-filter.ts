@@ -5,6 +5,8 @@
 import { minimatch } from 'minimatch';
 import { createDebugLog } from './debug.js';
 import { getCachedRule, type DiscoveredRule } from './rule-discovery.js';
+import type { RuleMetadata } from './rule-metadata.js';
+import { buildCanonicalRuleIdMap } from './rule-registry.js';
 
 const debugLog = createDebugLog();
 
@@ -67,6 +69,14 @@ export interface FilterResult {
   matchedPaths: string[];
 }
 
+export interface MatchedRule {
+  filePath: string;
+  relativePath: string;
+  ruleId: string;
+  content: string;
+  metadata?: RuleMetadata;
+}
+
 /**
  * Runtime filter context for conditional rule matching
  */
@@ -102,16 +112,45 @@ export async function readAndFormatRules(
   files: DiscoveredRule[],
   context: RuleFilterContext = {}
 ): Promise<FilterResult> {
-  if (files.length === 0) {
-    return { formattedRules: '', matchedPaths: [] };
+  const matchedRules = await readMatchingRules(files, context);
+
+  return {
+    formattedRules: formatRulesForPrompt(matchedRules),
+    matchedPaths: matchedRules.map(rule => rule.filePath),
+  };
+}
+
+export function formatRulesForPrompt(
+  rules: Array<Pick<MatchedRule, 'relativePath' | 'content'>>
+): string {
+  if (rules.length === 0) {
+    return '';
   }
 
-  const ruleContents: string[] = [];
-  const matchedPaths: string[] = [];
+  const ruleContents = rules.map(
+    rule => `## ${rule.relativePath}\n\n${rule.content}`
+  );
+
+  return (
+    `# OpenCode Rules\n\nPlease follow the following rules:\n\n` +
+    ruleContents.join('\n\n---\n\n')
+  );
+}
+
+export async function readMatchingRules(
+  files: DiscoveredRule[],
+  context: RuleFilterContext = {}
+): Promise<MatchedRule[]> {
+  if (files.length === 0) {
+    return [];
+  }
+
+  const matchedRules: MatchedRule[] = [];
   const availableToolSet =
     context.availableToolIDs && context.availableToolIDs.length > 0
       ? new Set(context.availableToolIDs)
       : undefined;
+  const ruleIdMap = buildCanonicalRuleIdMap(files);
 
   for (const { filePath, relativePath } of files) {
     // Use cached rule data with mtime-based invalidation
@@ -252,18 +291,14 @@ export async function readAndFormatRules(
 
     // Use cached stripped content for output
     // Use relativePath for unique headings instead of just filename
-    ruleContents.push(`## ${relativePath}\n\n${strippedContent}`);
-    matchedPaths.push(filePath);
+    matchedRules.push({
+      filePath,
+      relativePath,
+      ruleId: ruleIdMap.get(filePath) ?? relativePath,
+      content: strippedContent,
+      ...(metadata ? { metadata } : {}),
+    });
   }
 
-  if (ruleContents.length === 0) {
-    return { formattedRules: '', matchedPaths: [] };
-  }
-
-  return {
-    formattedRules:
-      `# OpenCode Rules\n\nPlease follow the following rules:\n\n` +
-      ruleContents.join('\n\n---\n\n'),
-    matchedPaths,
-  };
+  return matchedRules;
 }

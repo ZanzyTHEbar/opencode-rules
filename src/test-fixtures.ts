@@ -108,6 +108,8 @@ interface MockPluginInput {
   testDir: string;
   toolIds?: string[];
   mcpStatus?: Record<string, { status: string }>;
+  sessionPrompt?: (input: unknown) => Promise<unknown>;
+  sessionMessage?: (input: unknown) => Promise<unknown>;
 }
 
 /**
@@ -118,6 +120,10 @@ export function createMockPluginInput(opts: MockPluginInput): {
     tool: { ids: () => Promise<{ data: string[] }> };
     mcp?: {
       status: () => Promise<{ data: Record<string, { status: string }> }>;
+    };
+    session?: {
+      prompt?: (input: unknown) => Promise<unknown>;
+      message?: (input: unknown) => Promise<unknown>;
     };
   };
   project: Record<string, unknown>;
@@ -131,6 +137,10 @@ export function createMockPluginInput(opts: MockPluginInput): {
     mcp?: {
       status: () => Promise<{ data: Record<string, { status: string }> }>;
     };
+    session?: {
+      prompt?: (input: unknown) => Promise<unknown>;
+      message?: (input: unknown) => Promise<unknown>;
+    };
   } = {
     tool: { ids: async () => ({ data: opts.toolIds ?? [] }) },
   };
@@ -139,6 +149,16 @@ export function createMockPluginInput(opts: MockPluginInput): {
     client.mcp = {
       status: async () => ({ data: opts.mcpStatus! }),
     };
+  }
+
+  if (opts.sessionPrompt || opts.sessionMessage) {
+    client.session = {};
+    if (opts.sessionPrompt) {
+      client.session.prompt = opts.sessionPrompt;
+    }
+    if (opts.sessionMessage) {
+      client.session.message = opts.sessionMessage;
+    }
   }
 
   return {
